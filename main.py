@@ -1,79 +1,127 @@
 import os
-import requests
-import yt_dlp
+import asyncio
 import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import sqlite3
+import yt_dlp
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatMemberStatus
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
-# إعداد السجلات
+# 1. إعدادات البوت والمسؤول
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- إعدادات التحميل ---
+TOKEN = "8722121336:AAFT2Grwg5aysIe0Vcg3sSM2IQR9lG3UA0c"
+ADMIN_ID = 5504483293  # آيدي حسابك
+CHANNEL_ID = "@gdudhd90" # معرف قناتك (يجب أن يكون البوت مشرفاً فيها)
+DB_NAME = "bot_database.db"
 DOWNLOAD_DIR = "downloads"
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
 
-# دالة للتحميل من السوشيال ميديا (YouTube, TikTok, etc)
-def download_social_video(url):
-    ydl_opts = {
-        'format': 'best',
-        'outtmpl': f'{DOWNLOAD_DIR}/%(title)s.%(ext)s',
-        'quiet': True,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info)
+# 2. وظائف قاعدة البيانات
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users 
+                 (user_id INTEGER PRIMARY KEY, username TEXT)''')
+    conn.commit()
+    conn.close()
 
-# دالة للتحميل من الروابط المباشرة (Files/Images)
-def download_direct_file(url):
-    local_filename = os.path.join(DOWNLOAD_DIR, url.split('/')[-1])
-    with requests.get(url, stream=True) as r:
-        r.raise_for_status()
-        with open(local_filename, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-    return local_filename
+def add_user(user_id, username):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
+    conn.commit()
+    conn.close()
 
-# --- معالجة الرسائل ---
+init_db()
+
+# 3. التحقق من الاشتراك الإجباري
+async def is_subscribed(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        # التحقق إذا كان العضو موجوداً (مالك، مشرف، أو عضو عادي)
+        return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER]
+    except Exception:
+        return False
+
+# 4. واجهة البوت الرئيسية
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("مرحباً بك! أرسل لي أي رابط (فيديو، صورة، أو ملف) وسأقوم بتحميله لك.")
+    user = update.effective_user
+    add_user(user.id, user.username)
 
+    # فحص الاشتراك
+    if not await is_subscribed(context, user.id):
+        keyboard = [
+            [InlineKeyboardButton("📢 اشترك في القناة أولاً", url=f"https://t.me/{CHANNEL_ID.replace('@', '')}")],
+            [InlineKeyboardButton("✅ تم الاشتراك، فعل البوت", callback_data="check_sub")]
+        ]
+        await update.message.reply_text(
+            f"⚠️ عذراً عزيزي، يجب عليك الاشتراك في قناة البوت أولاً لتتمكن من استخدامه!\n\nقناتنا: {CHANNEL_ID}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    welcome_text = (
+        f"👻┆ أهلاً بك عزيزي، في بوت التحميل الشامل \n"
+        f"📥┆ **المنصات المدعومة:**\n"
+        f"🔺 يوتيوب | 🎵 تيك توك | 📷 انستقرام | 🔵 فيسبوك \n\n"
+        f"- أرسل الرابط الآن للبدء ♡"
+    )
+    keyboard = [[InlineKeyboardButton("❗┆ كيفية الاستخدام", callback_data='help')]]
+    await update.message.reply_text(welcome_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+
+# 5. معالجة الروابط (مع فحص اشتراك)
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if not await is_subscribed(context, user_id):
+        await update.message.reply_text(f"❌ يجب عليك الاشتراك في القناة أولاً: {CHANNEL_ID}")
+        return
+
     url = update.message.text
-    msg = await update.message.reply_text("جاري المعالجة... انتظر قليلاً ⏳")
+    if not url.startswith("http"): return
+
+    status_msg = await update.message.reply_text("جاري التحميل... ⏳")
     
     try:
-        # محاولة التحميل كفيديو سوشيال ميديا أولاً
-        try:
-            file_path = download_social_video(url)
-        except:
-            # إذا فشل، نحاول كتحميل مباشر للملف
-            file_path = download_direct_file(url)
-
-        # إرسال الملف للمستخدم
-        with open(file_path, 'rb') as document:
-            await update.message.reply_document(document=document, caption="تم التحميل بنجاح ✅")
+        ydl_opts = {'format': 'best', 'outtmpl': f'{DOWNLOAD_DIR}/%(title)s.%(ext)s', 'quiet': True}
         
-        # حذف الملف من السيرفر بعد الإرسال لتوفير المساحة
+        def dl():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                return ydl.prepare_filename(info)
+
+        file_path = await asyncio.to_thread(dl)
+        
+        await status_msg.edit_text("جاري الرفع... 📤")
+        with open(file_path, 'rb') as video:
+            await update.message.reply_video(video=video, caption="تم التحميل بواسطة @YourBot ✅")
+        
         os.remove(file_path)
-        await msg.delete()
+        await status_msg.delete()
 
     except Exception as e:
-        await msg.edit_text(f"عذراً، حدث خطأ أثناء التحميل: {str(e)}")
+        await status_msg.edit_text("❌ فشل التحميل، تأكد من الرابط.")
 
-# --- تشغيل البوت ---
-def main():
-    # ضع التوكن الخاص بك هنا
-    TOKEN = "8722121336:AAFT2Grwg5aysIe0Vcg3sSM2IQR9lG3UA0c"
+# 6. معالجة ضغطات الأزرار
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     
+    if query.data == "check_sub":
+        if await is_subscribed(context, query.from_user.id):
+            await query.message.delete()
+            await start(update, context) # إعادة تشغيل البوت للمشترك
+        else:
+            await context.bot.send_message(chat_id=query.from_user.id, text="❌ لم تشترك بعد! فضلاً اشترك ثم اضغط زر التحقق.")
+
+# 7. تشغيل البوت
+if __name__ == '__main__':
+    if not os.path.exists(DOWNLOAD_DIR): os.makedirs(DOWNLOAD_DIR)
     app = Application.builder().token(TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
     
-    print("البوت يعمل الآن...")
+    print("البوت يعمل مع خاصية الاشتراك الإجباري...")
     app.run_polling()
-
-if __name__ == '__main__':
-    main()
-
